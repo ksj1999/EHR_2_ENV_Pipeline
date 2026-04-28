@@ -68,7 +68,7 @@ respiratory risk scores in real time. Built for CSE 5114.
                                   Airflow */10 (sync_to_s3 → COPY INTO)
                                                        ▼
                                 ┌──────────────────────────────────────┐
-                                │ Snowflake (KANGAROO_DB.PUBLIC)       │
+                                │ Snowflake (warehouse + DB.PUBLIC)    │
                                 │  respiratory_risk_scores  (events)   │
                                 │  patient_respiratory_features (dim)  │
                                 │  respiratory_alerts       (alerts)   │
@@ -161,7 +161,7 @@ checkpoint at the last committed Kafka offset.
 
 | Setting | Value | Why |
 |---|---|---|
-| Auth | Key-pair (RSA `.p8`) | Account UNB02139 mandates key-pair; no passwords in code |
+| Auth | Key-pair (RSA `.p8`) | Snowflake account uses key-pair auth; no passwords in code |
 | Warehouse | `XS` (configurable) | Adequate for COPY INTO + dashboard queries on this volume |
 | Storage integration | `s3_synthea_int` → `synthea-full-bucket` | Lets Snowflake read S3 directly via STAGE without re-uploading |
 | Stage format | Parquet | Same format Spark writes; column-pruning works |
