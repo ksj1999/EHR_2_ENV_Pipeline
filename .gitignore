@@ -1,0 +1,72 @@
+# ── Credentials / secrets ─────────────────────────────────────────────────
+*.pem
+*.key
+*.p8
+*.crt
+.env
+.env.*
+secrets.toml
+.streamlit/secrets.toml
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# ── Spark ─────────────────────────────────────────────────────────────────
+spark-warehouse/
+metastore_db/
+derby.log
+_spark_metadata/
+
+# ── Streaming checkpoints / runtime ───────────────────────────────────────
+checkpoints/
+*_checkpoints/
+
+# ── Local data + outputs (these are runtime artifacts, not source) ────────
+data/
+output/
+logs/
+*.log
+*.parquet
+*.crc
+
+# ── Synthea raw data (large) ──────────────────────────────────────────────
+synthea/
+synthea_*/
+*.zip
+*.tar.gz
+*.tgz
+
+# ── Airflow (if running locally) ──────────────────────────────────────────
+airflow.cfg
+airflow.db
+airflow-webserver.pid
+webserver_config.py
+standalone_admin_password.txt
+
+# ── IDE / editor ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# md files (documentation, reports, etc.)
+respiratory_risk_pipeline_threshold_scoring.md
+progress.md
+PROGRESS_REPORT.md
