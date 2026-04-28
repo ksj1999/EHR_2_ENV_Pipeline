@@ -18,7 +18,6 @@ from email.mime.text import MIMEText
 
 from airflow import DAG
 from airflow.models import Variable
-from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.standard.operators.python import PythonOperator
 
@@ -43,34 +42,9 @@ with DAG(
 ) as dag:
 
     # -----------------------------------------------------------------------
-    # Task 1 — Sync streaming risk scores from EBS to S3
-    # -----------------------------------------------------------------------
-    sync_risk_scores = BashOperator(
-        task_id="sync_risk_scores_to_s3",
-        bash_command=(
-            "mkdir -p /mnt/synthea_data/output/respiratory_patient_features && "
-            "aws s3 sync "
-            "/mnt/synthea_data/output/respiratory_patient_features "
-            "s3://synthea-full-bucket/processed/respiratory_patient_features "
-            '--exclude "_spark_metadata*"'
-        ),
-    )
-
-    # -----------------------------------------------------------------------
-    # Task 2 — Sync location manifest from EBS to S3
-    # -----------------------------------------------------------------------
-    sync_location_manifest = BashOperator(
-        task_id="sync_location_manifest_to_s3",
-        bash_command=(
-            "aws s3 sync "
-            "/mnt/synthea_data/output/location_manifest "
-            "s3://synthea-full-bucket/processed/location_manifest "
-            '--exclude "_SUCCESS"'
-        ),
-    )
-
-    # -----------------------------------------------------------------------
-    # Task 3 — COPY new risk score Parquet files into Snowflake
+    # Task 1 — COPY new risk score Parquet files into Snowflake
+    # (Spark Structured Streaming writes parquet directly to S3 via the s3a
+    # filesystem, so the previous EBS→S3 sync tasks are no longer needed.)
     # -----------------------------------------------------------------------
     load_risk_scores = SQLExecuteQueryOperator(
         task_id="load_risk_scores_to_snowflake",
@@ -98,6 +72,28 @@ with DAG(
               MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
               FILE_FORMAT = (TYPE = PARQUET)
               FORCE = FALSE;
+        """,
+    )
+
+    # -----------------------------------------------------------------------
+    # Task 4b — Refresh dim_location (one row per location_id, no patients)
+    # CREATE OR REPLACE so the dim is always in sync with patient_respiratory_features.
+    # -----------------------------------------------------------------------
+    refresh_dim_location = SQLExecuteQueryOperator(
+        task_id="refresh_dim_location",
+        conn_id="snowflake_default",
+        sql="""
+            CREATE OR REPLACE TABLE dim_location AS
+            SELECT
+              location_id,
+              ANY_VALUE(city)  AS city,
+              ANY_VALUE(state) AS state,
+              ANY_VALUE(zip)   AS zip,
+              ANY_VALUE(lat)   AS lat,
+              ANY_VALUE(lon)   AS lon
+            FROM patient_respiratory_features
+            WHERE city IS NOT NULL
+            GROUP BY location_id;
         """,
     )
 
@@ -262,11 +258,10 @@ Dashboard: {dashboard_url}
     # -----------------------------------------------------------------------
     # Dependencies
     #
-    #   sync_risk_scores ──┐
-    #                      ├──► load_risk_scores ──┐
-    #   sync_location  ────┘                       ├──► generate_alerts ──► send_email ──► row_count_check
-    #                         load_patient_features ┘
+    #   load_risk_scores ─────────────────────┐
+    #                                          ├──► generate_alerts ──► send_email ──► row_count_check
+    #   load_patient_features ──► refresh_dim_location ┘
     # -----------------------------------------------------------------------
-    [sync_risk_scores, sync_location_manifest] >> load_risk_scores
-    [load_risk_scores, load_patient_features] >> generate_alerts
+    load_patient_features >> refresh_dim_location
+    [load_risk_scores, refresh_dim_location] >> generate_alerts
     generate_alerts >> send_email >> row_count_check

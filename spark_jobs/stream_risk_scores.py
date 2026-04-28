@@ -130,7 +130,12 @@ def main():
         .getOrCreate()
     )
 
-    features_df = spark.read.parquet(args.features_dir)
+    # Load the (pre-filtered) respiratory cohort and cache + materialize so
+    # the broadcast happens once at startup rather than on every microbatch.
+    features_df = spark.read.parquet(args.features_dir).cache()
+    cohort_size = features_df.count()
+    print(f"Loaded respiratory cohort: {cohort_size:,} patients "
+          f"(broadcasting to executors for stream join)")
 
     weather_schema = T.StructType(
         [
@@ -175,7 +180,11 @@ def main():
     weather_df = parsed_weather_df.alias("weather")
     patient_df = features_df.alias("patient")
 
-    joined_df = weather_df.join(patient_df, on="location_id", how="inner")
+    # Explicit broadcast hint: forces a broadcast hash join instead of
+    # sort-merge with shuffle. The cohort is small enough to fit in
+    # executor memory, so each microbatch's events are joined locally
+    # against an in-memory copy of the dim — no per-batch shuffle.
+    joined_df = weather_df.join(F.broadcast(patient_df), on="location_id", how="inner")
 
     # Weather components — kept separate so we can apply condition-specific weighting
     components = compute_weather_components()

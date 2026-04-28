@@ -69,9 +69,10 @@ respiratory risk scores in real time. Built for CSE 5114.
                                                        ▼
                                 ┌──────────────────────────────────────┐
                                 │ Snowflake (warehouse + DB.PUBLIC)    │
-                                │  respiratory_risk_scores  (events)   │
+                                │  respiratory_risk_scores  (fact)     │
                                 │  patient_respiratory_features (dim)  │
-                                │  respiratory_alerts       (alerts)   │
+                                │  dim_location             (dim)      │
+                                │  respiratory_alerts       (fact)     │
                                 │  respiratory_risk_scores_current (V) │
                                 └──────────────┬───────────────────────┘
                                                │
@@ -145,17 +146,46 @@ the real-time scorer.
 | Setting | Value | Why |
 |---|---|---|
 | Source | Kafka topic `environment_raw`, `startingOffsets=latest` | Tail mode — process only new events |
-| Sink | Parquet on EBS (`/mnt/synthea_data/checkpoints/...`) | Local SSD-backed; Airflow promotes to S3 |
+| Sink | Parquet on S3 (`s3a://.../processed/respiratory_patient_features`) | Direct write avoids EBS→S3 sync hop |
 | Output mode | `append` | Each event is independent; no aggregation across triggers |
 | Trigger | Default (microbatch as fast as Kafka delivers) | Open-Meteo only emits every 5 min, so this idles correctly |
-| Checkpoint | `/mnt/synthea_data/checkpoints/respiratory_patient_features` | Required for exactly-once Kafka offsets |
+| Checkpoint | `/mnt/synthea_data/checkpoints/respiratory_patient_features` | EBS-backed; required for exactly-once Kafka offsets |
 | Watermark | None | We don't need event-time aggregation; weather events score independently |
-| Join | `inner` join Kafka stream ↔ static patient features parquet on `location_id` | Patient features fit in driver memory; broadcast-style join |
+| Join | `inner` join Kafka stream ↔ pre-filtered cohort with `broadcast()` hint | See "Streaming Join Optimization" below |
 | Packages | `spark-sql-kafka-0-10_2.12:3.5.1`, `hadoop-aws:3.3.4` | Kafka source + S3 access |
 | Output schema | event_id, event_time, location_id, weather metrics, patient_id, weather_risk_score, final_risk_score, final_risk_level | One row per (patient × weather event) |
 
 The job is restart-safe: if you `pkill` and re-run, Spark resumes from the
 checkpoint at the last committed Kafka offset.
+
+#### Streaming Join Optimization
+
+Joining the full ~4.78 M-row patient feature table against every weather
+event would force Spark into a sort-merge plan with a 200-way shuffle on
+every microbatch (observed at ~10 s for a 48-row batch in the unoptimized
+baseline). Two complementary optimizations bring per-batch cost down to
+~1 s with no shuffle on the patient side:
+
+1. **Cohort pre-filter (batch layer).** `build_patient_features.py` writes
+   a second parquet at `…_cohort` containing only patients with any
+   chronic respiratory condition (asthma, COPD spectrum, recent
+   pneumonia/respiratory infection) or active respiratory medication
+   (oxygen, steroid, inhaler, leukotriene modifier). This drops the
+   join's right-hand side by roughly an order of magnitude — patients
+   without plausible exposure-driven respiratory risk are excluded from
+   per-event scoring.
+
+2. **Broadcast hash join (streaming layer).** `stream_risk_scores.py`
+   reads from the cohort parquet, calls `.cache()` and then `.count()` to
+   materialize the cache once at startup, and applies an explicit
+   `F.broadcast(patient_df)` hint on the join. This forces Spark to ship
+   the cohort once to every executor and join locally, eliminating the
+   per-microbatch shuffle of the patient side entirely.
+
+Combined, the join cost shifts from O(microbatch + cohort) per batch
+(sort-merge + shuffle) to O(microbatch) per batch with a one-time
+O(cohort) broadcast at job start — essential for sustained streaming
+throughput as Kafka volume grows.
 
 ### Snowflake
 
@@ -185,20 +215,25 @@ orchestration layer.
 Tasks (in order):
 
 ```
-sync_risk_scores ──┐
-                   ├── load_risk_scores ──┐
-sync_location ────┘                       ├── generate_alerts ── send_email ── row_count_check
-              load_patient_features ──────┘
+load_risk_scores ─────────────────────────┐
+                                           ├── generate_alerts ── send_email ── row_count_check
+load_patient_features ── refresh_dim_location ┘
 ```
 
 | Task | What it does |
 |---|---|
-| `sync_risk_scores_to_s3` | `aws s3 sync` of EBS streaming output → S3 (excludes `_spark_metadata`) |
-| `sync_location_manifest_to_s3` | Same for the location manifest CSV |
-| `load_risk_scores_to_snowflake` | `COPY INTO respiratory_risk_scores` |
+| `load_risk_scores_to_snowflake` | `COPY INTO respiratory_risk_scores` from the S3 stage Spark writes to |
 | `load_patient_features_to_snowflake` | `COPY INTO patient_respiratory_features` |
+| `refresh_dim_location` | `CREATE OR REPLACE TABLE dim_location` from the patient table — keeps the location dim in sync |
 | `generate_high_risk_alerts` | INSERT new HIGH patients into `respiratory_alerts`, deduped against last 24h |
 | `send_alert_email` | Gmail SMTP summary (top locations + worst cases) — only fires if new alerts exist |
+| `row_count_check` | UNION-ALL row counts across the three main tables (logged) |
+
+> **Note:** Earlier versions of the DAG had `sync_risk_scores_to_s3` and
+> `sync_location_manifest_to_s3` BashOperators that ran `aws s3 sync` from
+> EBS to S3 before the COPY INTO. Those were removed: Spark Structured
+> Streaming now writes directly to S3 via the `s3a://` filesystem, so the
+> intermediate sync step was a no-op.
 | `row_count_check` | UNION ALL row counts across the three main tables (logged for visibility) |
 
 ### Streamlit dashboard
@@ -239,7 +274,7 @@ One row per scored Kafka event.
 | `event_id` | STRING | Producer-generated unique id |
 | `event_time` | TIMESTAMP_NTZ | UTC; weather observation time |
 | `kafka_timestamp` | TIMESTAMP_NTZ | When Kafka received the event |
-| `location_id` | STRING | Lowercased `<city>_<state>` |
+| `location_id` | STRING | FK → `dim_location.location_id` (lowercased `<city>_<state>`) |
 | `patient_id` | STRING | FK → `patient_respiratory_features.patient_id` |
 | `temperature_c`, `pm25`, `pm10`, `ozone`, `nitrogen_dioxide`, `aqi`, `humidity`, `wind_speed` | NUMBER | Raw weather/AQI |
 | `weather_risk_score` | NUMBER | 0–15 typical |
@@ -262,6 +297,21 @@ One row per patient. Rebuilt by `build_patient_features.py`.
 | `ehr_risk_score` | INT | Capped at 25 |
 | `ehr_risk_level` | STRING | `low` (<6) / `medium` (6–11) / `high` (≥12) |
 | `last_updated` | DATE | Reference date used in computation |
+
+### `dim_location` (dimension)
+
+One row per location. Refreshed on every Airflow run via `refresh_dim_location`
+(`CREATE OR REPLACE` from `patient_respiratory_features`). Lets queries that
+need city/state for a location join a small dim instead of going through the
+1.5M-row patient table.
+
+| Column | Type | Notes |
+|---|---|---|
+| `location_id` | STRING | PK — lowercased `<city>_<state>` |
+| `city` | STRING | |
+| `state` | STRING | |
+| `zip` | STRING | Representative ZIP |
+| `lat`, `lon` | NUMBER | May be NULL on legacy Synthea exports |
 
 ### `respiratory_risk_scores_current` (view)
 

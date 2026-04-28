@@ -12,6 +12,87 @@ from datetime import date
 from pyspark.sql import SparkSession, functions as F
 
 
+# All 351 Massachusetts incorporated municipalities (cities + towns).
+# Source: Massachusetts Secretary of the Commonwealth.
+# Used to validate parsed city values from legacy Synthea ADDRESS strings —
+# anything that doesn't match a real MA municipality is dropped, preventing
+# garbage like "Fletcher Isle New Bedford" from polluting dim_location.
+MA_MUNICIPALITIES = [
+    "Abington", "Acton", "Acushnet", "Adams", "Agawam", "Alford", "Amesbury",
+    "Amherst", "Andover", "Aquinnah", "Arlington", "Ashburnham", "Ashby",
+    "Ashfield", "Ashland", "Athol", "Attleboro", "Auburn", "Avon", "Ayer",
+    "Barnstable", "Barre", "Becket", "Bedford", "Belchertown", "Bellingham",
+    "Belmont", "Berkley", "Berlin", "Bernardston", "Beverly", "Billerica",
+    "Blackstone", "Blandford", "Bolton", "Boston", "Bourne", "Boxborough",
+    "Boxford", "Boylston", "Braintree", "Brewster", "Bridgewater", "Brimfield",
+    "Brockton", "Brookfield", "Brookline", "Buckland", "Burlington",
+    "Cambridge", "Canton", "Carlisle", "Carver", "Charlemont", "Charlton",
+    "Chatham", "Chelmsford", "Chelsea", "Cheshire", "Chester", "Chesterfield",
+    "Chicopee", "Chilmark", "Clarksburg", "Clinton", "Cohasset", "Colrain",
+    "Concord", "Conway", "Cummington",
+    "Dalton", "Danvers", "Dartmouth", "Dedham", "Deerfield", "Dennis",
+    "Dighton", "Douglas", "Dover", "Dracut", "Dudley", "Dunstable", "Duxbury",
+    "East Bridgewater", "East Brookfield", "East Longmeadow", "Eastham",
+    "Easthampton", "Easton", "Edgartown", "Egremont", "Erving", "Essex",
+    "Everett",
+    "Fairhaven", "Fall River", "Falmouth", "Fitchburg", "Florida",
+    "Foxborough", "Framingham", "Franklin", "Freetown",
+    "Gardner", "Georgetown", "Gill", "Gloucester", "Goshen", "Gosnold",
+    "Grafton", "Granby", "Granville", "Great Barrington", "Greenfield",
+    "Groton", "Groveland",
+    "Hadley", "Halifax", "Hamilton", "Hampden", "Hancock", "Hanover", "Hanson",
+    "Hardwick", "Harvard", "Harwich", "Hatfield", "Haverhill", "Hawley",
+    "Heath", "Hingham", "Hinsdale", "Holbrook", "Holden", "Holland",
+    "Holliston", "Holyoke", "Hopedale", "Hopkinton", "Hubbardston", "Hudson",
+    "Hull", "Huntington",
+    "Ipswich",
+    "Kingston",
+    "Lakeville", "Lancaster", "Lanesborough", "Lawrence", "Lee", "Leicester",
+    "Lenox", "Leominster", "Leverett", "Lexington", "Leyden", "Lincoln",
+    "Littleton", "Longmeadow", "Lowell", "Ludlow", "Lunenburg", "Lynn",
+    "Lynnfield",
+    "Malden", "Manchester-By-The-Sea", "Mansfield", "Marblehead", "Marion",
+    "Marlborough", "Marshfield", "Mashpee", "Mattapoisett", "Maynard",
+    "Medfield", "Medford", "Medway", "Melrose", "Mendon", "Merrimac",
+    "Methuen", "Middleborough", "Middlefield", "Middleton", "Milford",
+    "Millbury", "Millis", "Millville", "Milton", "Monroe", "Monson",
+    "Montague", "Monterey", "Montgomery", "Mount Washington",
+    "Nahant", "Nantucket", "Natick", "Needham", "New Ashford", "New Bedford",
+    "New Braintree", "New Marlborough", "New Salem", "Newbury", "Newburyport",
+    "Newton", "Norfolk", "North Adams", "North Andover", "North Attleborough",
+    "North Brookfield", "North Reading", "Northampton", "Northborough",
+    "Northbridge", "Northfield", "Norton", "Norwell", "Norwood",
+    "Oak Bluffs", "Oakham", "Orange", "Orleans", "Otis", "Oxford",
+    "Palmer", "Paxton", "Peabody", "Pelham", "Pembroke", "Pepperell", "Peru",
+    "Petersham", "Phillipston", "Pittsfield", "Plainfield", "Plainville",
+    "Plymouth", "Plympton", "Princeton", "Provincetown",
+    "Quincy",
+    "Randolph", "Raynham", "Reading", "Rehoboth", "Revere", "Richmond",
+    "Rochester", "Rockland", "Rockport", "Rowe", "Rowley", "Royalston",
+    "Russell", "Rutland",
+    "Salem", "Salisbury", "Sandisfield", "Sandwich", "Saugus", "Savoy",
+    "Scituate", "Seekonk", "Sharon", "Sheffield", "Shelburne", "Sherborn",
+    "Shirley", "Shrewsbury", "Shutesbury", "Somerset", "Somerville",
+    "South Hadley", "Southampton", "Southborough", "Southbridge", "Southwick",
+    "Spencer", "Springfield", "Sterling", "Stockbridge", "Stoneham",
+    "Stoughton", "Stow", "Sturbridge", "Sudbury", "Sunderland", "Sutton",
+    "Swampscott", "Swansea",
+    "Taunton", "Templeton", "Tewksbury", "Tisbury", "Tolland", "Topsfield",
+    "Townsend", "Truro", "Tyngsborough", "Tyringham",
+    "Upton", "Uxbridge",
+    "Wakefield", "Wales", "Walpole", "Waltham", "Ware", "Wareham", "Warren",
+    "Warwick", "Washington", "Watertown", "Wayland", "Webster", "Wellesley",
+    "Wellfleet", "Wendell", "Wenham", "West Boylston", "West Bridgewater",
+    "West Brookfield", "West Newbury", "West Springfield", "West Stockbridge",
+    "West Tisbury", "Westborough", "Westfield", "Westford", "Westhampton",
+    "Westminster", "Weston", "Westport", "Westwood", "Weymouth", "Whately",
+    "Whitman", "Wilbraham", "Williamsburg", "Williamstown", "Wilmington",
+    "Winchendon", "Winchester", "Windsor", "Winthrop", "Woburn", "Worcester",
+    "Worthington", "Wrentham",
+    "Yarmouth",
+]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Build patient respiratory risk features from raw Synthea EHR tables."
@@ -290,8 +371,20 @@ def main():
 
     # Synthea ships in two formats:
     # Modern (has CITY/STATE/ZIP/LAT/LON columns directly)
-    # Legacy (17-col: city/state/zip embedded in ADDRESS string)
-    addr_pattern = r".*? ([A-Za-z .'\-]+) ([A-Z]{2}) ([0-9]{5}) US$"
+    # Legacy (17-col: city/state/zip embedded in ADDRESS string).
+    #
+    # The address looks like "<num> <street...> <City Name> <ST> <zip> US".
+    # The OLD greedy pattern `([A-Za-z .'\-]+)` swallowed the street name
+    # together with the city ("Fletcher Isle New Bedford"). This pattern
+    # uses a non-greedy prefix and only allows known multi-word city
+    # prefixes (New, North, South, East, West, Fall, Great) — single-word
+    # cities like "Boston" still match cleanly, and two-word MA cities
+    # ("New Bedford", "Fall River", "North Andover") get parsed correctly
+    # without dragging in the street name.
+    addr_pattern = (
+        r"^.+? ((?:(?:New|North|South|East|West|Fall|Great)\s)?"
+        r"[A-Z][a-z]+) ([A-Z]{2}) ([0-9]{5}) US$"
+    )
     id_col = "Id" if "Id" in patients_df.columns else "ID"
 
     if "CITY" in patients_df.columns:
@@ -332,12 +425,25 @@ def main():
             )
         )
 
+    # Normalize city to title case ("new bedford" → "New Bedford") then drop
+    # rows whose city isn't a real Massachusetts municipality. This eliminates
+    # the dim_location bloat that came from the legacy ADDRESS regex
+    # accidentally capturing street names ("Fletcher Isle New Bedford") —
+    # only the 351 real MA cities/towns survive. Non-MA patients are dropped
+    # since the rest of the pipeline (producer manifest, weather geocoding,
+    # dashboard map) is MA-scoped.
+    patients_clean = (
+        patients_clean
+        .withColumn("city", F.initcap(F.col("city")))
+        .filter((F.col("state") == "MA") & F.col("city").isin(MA_MUNICIPALITIES))
+    )
+
     patients_clean = patients_clean.withColumn(
         "location_id",
         F.concat_ws(
             "_",
-            F.regexp_replace(F.lower(F.coalesce(F.col("city"), F.lit("unknown"))), r"[^a-z0-9]+", "_"),
-            F.regexp_replace(F.lower(F.coalesce(F.col("state"), F.lit("unknown"))), r"[^a-z0-9]+", "_"),
+            F.regexp_replace(F.lower(F.col("city")),  r"[^a-z0-9]+", "_"),
+            F.regexp_replace(F.lower(F.col("state")), r"[^a-z0-9]+", "_"),
         ),
     )
 
@@ -386,6 +492,31 @@ def main():
     print(f"  HIGH:   {high:,}  ({100*high/total:.1f}%)")
     print(f"  MEDIUM: {medium:,}  ({100*medium/total:.1f}%)")
     print(f"  LOW:    {low:,}  ({100*low/total:.1f}%)")
+
+    # ── Cohort pre-filter for the streaming join ─────────────────────────────
+    # Write a separate, smaller parquet containing only patients with any
+    # respiratory condition or active respiratory medication. The streaming
+    # job reads from this cohort instead of the full feature table, which
+    # shrinks the broadcast-join right-hand side by ~10x and removes
+    # patients with no plausible exposure-driven respiratory risk from
+    # per-event scoring entirely.
+    cohort_df = summary_df.filter(
+        (F.col("has_asthma")                     == 1)
+        | (F.col("has_copd")                     == 1)
+        | (F.col("has_emphysema")                == 1)
+        | (F.col("has_chronic_bronchitis")       == 1)
+        | (F.col("recent_pneumonia")             == 1)
+        | (F.col("recent_respiratory_infection") == 1)
+        | (F.col("uses_oxygen")                  == 1)
+        | (F.col("uses_steroid")                 == 1)
+        | (F.col("uses_inhaler")                 == 1)
+        | (F.col("uses_respiratory_med")         == 1)
+    )
+    cohort_dir = args.output_dir.rstrip("/") + "_cohort"
+    cohort_df.write.mode("overwrite").parquet(cohort_dir)
+    cohort_n = cohort_df.count()
+    print(f"Wrote {cohort_n:,} respiratory cohort rows "
+          f"({100*cohort_n/total:.1f}% of total) to {cohort_dir}")
 
     spark.stop()
 

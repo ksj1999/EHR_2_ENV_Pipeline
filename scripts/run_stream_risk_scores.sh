@@ -9,7 +9,10 @@ CHECKPOINT_DIR="${RESPIRATORY_RISK_CHECKPOINT_DIR:-/mnt/synthea_data/checkpoints
 
 export SPARK_LOCAL_IP=127.0.0.1
 
-FEATURES_DIR="${FEATURES_DIR:-s3a://synthea-full-bucket/features/patient_respiratory_features}"
+# Streaming join uses the pre-filtered respiratory cohort, not the full
+# feature table. The cohort is ~10x smaller and fits comfortably in
+# executor memory for the broadcast join (see build_patient_features.py).
+FEATURES_DIR="${FEATURES_DIR:-s3a://synthea-full-bucket/features/patient_respiratory_features_cohort}"
 
 "$HOME/spark/bin/spark-submit" \
   --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,org.apache.hadoop:hadoop-aws:3.3.4 \

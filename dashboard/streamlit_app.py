@@ -177,13 +177,18 @@ def load_pollutant_trend_24h(location_id: str = ""):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_locations_with_cities():
-    """Distinct (location_id, city) pairs from patients with recent events."""
+    """Distinct (location_id, city) pairs for locations that actually have
+    recent events (vs the full dim_location, which contains many synthetic
+    address-derived locations without any weather coverage)."""
     return run_query("""
-        SELECT DISTINCT r.location_id, p.city
-        FROM   respiratory_risk_scores_current r
-        JOIN   patient_respiratory_features    p ON r.patient_id = p.patient_id
-        WHERE  p.city IS NOT NULL
-        ORDER  BY p.city
+        SELECT l.location_id, l.city
+        FROM   dim_location l
+        WHERE  l.city IS NOT NULL
+          AND  l.location_id IN (
+              SELECT DISTINCT location_id
+              FROM respiratory_risk_scores_current
+          )
+        ORDER  BY l.city
     """)
 
 
@@ -314,11 +319,13 @@ def load_patients_by_id_search(search: str, limit: int = 50):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_map_data():
+    # Joins the small dim_location table (one row per location) instead of the
+    # 1.5M-row patient table — same result, much cheaper.
     return run_query("""
         SELECT
           r.location_id,
-          p.city,
-          p.state,
+          l.city,
+          l.state,
           ROUND(AVG(r.final_risk_score), 2)                                AS avg_risk_score,
           CASE
             WHEN AVG(r.final_risk_score) >= 18 THEN 'high'
@@ -330,9 +337,9 @@ def load_map_data():
           SUM(CASE WHEN r.final_risk_level = 'medium' THEN 1 ELSE 0 END)  AS medium_count,
           SUM(CASE WHEN r.final_risk_level = 'low'    THEN 1 ELSE 0 END)  AS low_count
         FROM   respiratory_risk_scores_current r
-        JOIN   patient_respiratory_features    p ON r.patient_id = p.patient_id
-        WHERE  p.state IS NOT NULL
-        GROUP  BY r.location_id, p.city, p.state
+        JOIN   dim_location                    l ON r.location_id = l.location_id
+        WHERE  l.state IS NOT NULL AND l.city IS NOT NULL
+        GROUP  BY r.location_id, l.city, l.state
         ORDER  BY avg_risk_score DESC
     """)
 
