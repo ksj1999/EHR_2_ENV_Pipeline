@@ -52,11 +52,10 @@ respiratory risk scores in real time. Built for CSE 5114.
                 ┌────────────────────────────┐
                 │  Two parquet outputs on S3 │
                 │  ─────────────────────────  │
-                │  (a) ..._features          │ ──► Snowflake (loaded by
-                │      ~1.58M patients       │     Airflow; dashboard reads
-                │                            │     per-patient queries)
-                │  (b) ..._features_cohort   │ ──► broadcast input for
-                │      ~600K patients,       │     streaming join below
+                │  (a) ..._features          │
+                │      ~1.58M patients       │
+                │  (b) ..._features_cohort   │
+                │      ~600K patients,       │
                 │      respiratory only      │
                 └────────────────────────────┘
                                │
