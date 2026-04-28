@@ -122,14 +122,16 @@ Broker startup: [`scripts/start_kafka_services.sh`](scripts/start_kafka_services
 ### Spark — batch (EHR features)
 
 [`spark_jobs/build_patient_features.py`](spark_jobs/build_patient_features.py)
-processes the full 1.5 M-patient Synthea export.
+processes the full Synthea export and produces two outputs.
 
 | Setting | Value | Why |
 |---|---|---|
 | Input | `s3a://synthea-full-bucket/raw/synthea_csv/output_*/output_*/csv/*.csv` | 12 Synthea export shards |
-| Output | `s3a://synthea-full-bucket/features/patient_respiratory_features` (parquet) | Read by streaming job |
+| Primary output | `s3a://.../features/patient_respiratory_features` (parquet) | Loaded into Snowflake for the dashboard's per-patient queries |
+| **Cohort output** | `s3a://.../features/patient_respiratory_features_cohort` (parquet) | Pre-filtered to patients with any respiratory condition / med — the streaming join's broadcast input |
 | `spark.sql.shuffle.partitions` | `200` | Default; works for the full dataset |
 | Lookback window | `90 days` (configurable) | Recent encounters/meds carry more weight than ancient history |
+| **City validation** | Filter against 351-municipality MA dictionary | Drops malformed addresses where the legacy regex captured street names ("Fletcher Isle New Bedford") into `city` |
 | S3 packages | `org.apache.hadoop:hadoop-aws:3.3.4` | S3A filesystem support |
 | Credentials | `DefaultAWSCredentialsProviderChain` | Uses EC2 instance role; no keys in code |
 | Trigger | One-shot (`spark-submit` then exit) | Re-run when EHR data changes |
@@ -137,6 +139,15 @@ processes the full 1.5 M-patient Synthea export.
 The job uses `.cache()` on the final dataframe before computing
 high/medium/low counts so the three count operations don't force three
 separate S3 re-scans.
+
+**City validation rationale:** Legacy Synthea ADDRESS strings sometimes
+captured the street name into the `city` field via greedy regex (e.g.
+"Fletcher Isle New Bedford"), inflating `dim_location` to 782K rows. The
+job now validates every parsed `city` against `MA_MUNICIPALITIES` (a hardcoded
+set of all 351 incorporated MA cities/towns sourced from the Massachusetts
+Secretary of the Commonwealth). Rows whose `city` doesn't match a real
+municipality are dropped before the location_id is built. After this
+filter `dim_location` is bounded at ≤351 rows.
 
 ### Spark — streaming (risk scoring)
 
@@ -300,17 +311,18 @@ One row per patient. Rebuilt by `build_patient_features.py`.
 
 ### `dim_location` (dimension)
 
-One row per location. Refreshed on every Airflow run via `refresh_dim_location`
+One row per location. **Bounded at ≤ 351 rows** (the count of MA
+municipalities). Refreshed on every Airflow run via `refresh_dim_location`
 (`CREATE OR REPLACE` from `patient_respiratory_features`). Lets queries that
 need city/state for a location join a small dim instead of going through the
-1.5M-row patient table.
+1.5 M-row patient table.
 
 | Column | Type | Notes |
 |---|---|---|
 | `location_id` | STRING | PK — lowercased `<city>_<state>` |
-| `city` | STRING | |
-| `state` | STRING | |
-| `zip` | STRING | Representative ZIP |
+| `city` | STRING | Validated against MA municipality list — see batch job notes |
+| `state` | STRING | Always `MA` in current data |
+| `zip` | STRING | Representative ZIP for the city |
 | `lat`, `lon` | NUMBER | May be NULL on legacy Synthea exports |
 
 ### `respiratory_risk_scores_current` (view)
@@ -485,16 +497,38 @@ sudo mount /dev/nvme1n1 /mnt/synthea_data
 
 ### One-time setup
 
+You generally don't need to run these manually — `./scripts/start_pipeline.sh`
+auto-builds anything missing on first launch. The individual scripts exist
+for when you want to rebuild a specific artifact in isolation:
+
 ```bash
-# 1. Build the patient features (~10 min on full dataset)
+# Rebuild patient features + cohort parquet (~10 min on full dataset).
+# Re-run after changing the EHR scoring or the MA city dictionary.
 ./scripts/run_build_patient_features.sh
 
-# 2. Build the location manifest (sub-minute)
+# Rebuild the location manifest (sub-minute).
+# Re-run after the patient baseline changes.
 ./scripts/run_build_location_manifest.sh
 
-# 3. Create the Kafka topic (after Kafka is running — see below)
+# Create the Kafka topic (after Kafka is running). Idempotent.
 ./scripts/create_kafka_topic.sh
 ```
+
+After re-running `build_patient_features.py`, also wipe and re-load the
+Snowflake table so the dictionary cleanup propagates:
+
+```sql
+TRUNCATE TABLE patient_respiratory_features;
+COPY INTO patient_respiratory_features
+  FROM @patient_features_stage/
+  PATTERN = '.*part-.*\.parquet'
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  FILE_FORMAT = (TYPE = PARQUET)
+  FORCE = TRUE;
+```
+
+The next Airflow run will rebuild `dim_location` from the cleaned table
+automatically (`refresh_dim_location` task).
 
 ---
 
@@ -506,20 +540,33 @@ sudo mount /dev/nvme1n1 /mnt/synthea_data
 ./scripts/start_pipeline.sh
 ```
 
-Mounts the EBS volume, opens a tmux session named `pipeline` with five
-windows, and starts:
+**Self-bootstrapping** — safe to run on a fresh EC2 session, after a reboot,
+or on top of an already-running pipeline. The script:
+
+1. **Mounts EBS** if not mounted (`/mnt/synthea_data`)
+2. **Validates `.env`** exists and strips Windows CRLF if present
+3. **Auto-builds the location manifest** if missing (`build_location_manifest.py`, ~1 min)
+4. **Auto-builds the patient features + cohort parquet** if missing on S3 (`build_patient_features.py`, ~10 min)
+5. **Auto-downloads the MA towns GeoJSON** for the dashboard map if missing (~30 s)
+6. **Kills stale processes** from any previous run (Spark stream, producer, streamlit, kafka, zookeeper, airflow)
+7. **Sets up a fresh tmux session** named `pipeline` with five windows
+8. **Launches all five components** in the right order
 
 | Window | Service |
 |---|---|
-| `kafka` | ZooKeeper + Kafka broker |
-| `producer` | weather_producer (open-meteo mode) |
-| `stream` | Spark Structured Streaming risk scorer |
-| `dashboard` | Streamlit |
+| `kafka` | ZooKeeper + Kafka broker (creates topic) |
+| `producer` | weather_producer (open-meteo mode, 5-min cycle) |
+| `stream` | Spark Structured Streaming risk scorer (broadcast join) |
+| `dashboard` | Streamlit (sources `.env` for Snowflake creds) |
 | `airflow` | `airflow standalone` |
+
+Typical first-run on a fresh instance: ~12–15 min (most of it the cohort
+build). Subsequent runs (everything already in place): ~2 min.
 
 ```bash
 tmux attach -t pipeline   # attach
-# Ctrl-B then 0..4 to switch windows
+# Ctrl+B then 0..4 to switch windows
+# Ctrl+B then d to detach (leaves everything running)
 ```
 
 ### Manual / step-by-step
