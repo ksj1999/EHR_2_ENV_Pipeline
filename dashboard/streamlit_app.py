@@ -9,11 +9,13 @@ pipeline (stored in Snowflake). Three pages, switched via sidebar nav:
                       threshold-violation cards, per-region drill-down.
   - Patient Explorer — per-patient gauge + verdict + 7-day trend.
 
-Data source: Snowflake (account UNB02139, key-pair auth via rsa_key.p8).
+Data source: Snowflake (key-pair auth). Connection details are read from
+environment variables — see the README "Configuration" section.
 Caches: TTLs of 60–300s on most queries; 24h on the static MA town GeoJSON.
 """
 
 import decimal
+import os
 import warnings
 
 import plotly.express as px
@@ -27,16 +29,32 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="boto3")
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-SF_ACCOUNT     = "UNB02139"
-SF_USER        = "KANGAROO"
-SF_DATABASE    = "KANGAROO_DB"
-SF_SCHEMA      = "PUBLIC"
-SF_WAREHOUSE   = "KANGAROO_WH"
-SF_PRIVATE_KEY = "/home/ec2-user/.snowflake_keys/rsa_key.p8"
+SF_ACCOUNT     = os.environ.get("SNOWFLAKE_ACCOUNT")
+SF_USER        = os.environ.get("SNOWFLAKE_USER")
+SF_DATABASE    = os.environ.get("SNOWFLAKE_DATABASE")
+SF_SCHEMA      = os.environ.get("SNOWFLAKE_SCHEMA", "PUBLIC")
+SF_WAREHOUSE   = os.environ.get("SNOWFLAKE_WAREHOUSE")
+SF_PRIVATE_KEY = os.environ.get("SNOWFLAKE_PRIVATE_KEY_FILE")
+
+_REQUIRED_VARS = {
+    "SNOWFLAKE_ACCOUNT":           SF_ACCOUNT,
+    "SNOWFLAKE_USER":              SF_USER,
+    "SNOWFLAKE_DATABASE":          SF_DATABASE,
+    "SNOWFLAKE_WAREHOUSE":         SF_WAREHOUSE,
+    "SNOWFLAKE_PRIVATE_KEY_FILE":  SF_PRIVATE_KEY,
+}
 
 
 @st.cache_resource
 def get_conn():
+    missing = [name for name, value in _REQUIRED_VARS.items() if not value]
+    if missing:
+        st.error(
+            "Missing required environment variable(s): "
+            + ", ".join(missing)
+            + ". See the README \"Configuration\" section."
+        )
+        st.stop()
     return snowflake.connector.connect(
         account=SF_ACCOUNT,
         user=SF_USER,

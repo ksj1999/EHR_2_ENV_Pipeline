@@ -144,21 +144,17 @@ with DAG(
     # Task 6 — Send summary email if new alerts were generated this run
     # -----------------------------------------------------------------------
     def send_alert_email():
-        import snowflake.connector
+        # Use the existing snowflake_default Airflow Connection so credentials
+        # are stored in one place (no duplicate hardcoding).
+        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-        sender    = Variable.get("GMAIL_SENDER")
-        recipient = Variable.get("GMAIL_RECIPIENT")
-        password  = Variable.get("GMAIL_APP_PASSWORD")
+        sender        = Variable.get("GMAIL_SENDER")
+        recipient     = Variable.get("GMAIL_RECIPIENT")
+        password      = Variable.get("GMAIL_APP_PASSWORD")
+        dashboard_url = Variable.get("DASHBOARD_URL", default_var="http://localhost:8501")
 
-        conn = snowflake.connector.connect(
-            account="UNB02139",
-            user="KANGAROO",
-            private_key_file="/home/ec2-user/.snowflake_keys/rsa_key.p8",
-            database="KANGAROO_DB",
-            warehouse="KANGAROO_WH",
-            schema="PUBLIC",
-        )
-        cur = conn.cursor()
+        conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
+        cur  = conn.cursor()
 
         # New alerts from the last 15 minutes
         cur.execute("""
@@ -227,7 +223,7 @@ TOP LOCATIONS
 WORST CASES
 {case_lines}
 
-Dashboard: http://3.136.179.41:8501
+Dashboard: {dashboard_url}
         """.strip()
 
         msg = MIMEMultipart()
