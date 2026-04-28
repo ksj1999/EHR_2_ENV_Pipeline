@@ -625,6 +625,36 @@ for when you want to rebuild a specific artifact in isolation:
 ./scripts/create_kafka_topic.sh
 ```
 
+#### Extracting the SyntheticMass archive (very-first-time only)
+
+The SyntheticMass distribution is a tree of nested archives — a top-level
+`.tar.gz` containing twelve inner `.tar.gz` shards, each of which holds the
+actual `patients.csv`, `conditions.csv`, `encounters.csv`, and
+`medications.csv` files. Naively extracting only the top-level archive does
+not reveal the CSVs; the inner archives must be unpacked too. Two helper
+scripts handle this automatically:
+
+```bash
+# Option A — extract a top-level archive that's already on disk
+./scripts/extract_synthea_archive.sh \
+  /path/to/synthea_1m_fhir_3_0_May_24.tar.gz \
+  /mnt/synthea_data/synthea_csv
+
+# Option B — stream the top-level archive directly from S3 (no local copy)
+./scripts/extract_synthea_from_s3.sh \
+  s3://synthea-full-bucket/synthea_1m_fhir_3_0_May_24.tar.gz \
+  /mnt/synthea_data/synthea_csv
+```
+
+Both scripts repeatedly walk the output tree with `find`, unpack any
+remaining `.tar.gz` / `.tgz` / `.gz` files in place (deleting each archive
+after extraction so it isn't reprocessed), and loop until a pass finds no
+more nested archives. After extraction, the script lists the discovered
+`patients.csv` / `conditions.csv` / `encounters.csv` / `observations.csv`
+files so you can confirm the unpacking landed where expected. Upload the
+flattened CSVs to `s3://synthea-full-bucket/raw/synthea_csv/...` and
+`build_patient_features.py` will read them with a single glob pattern.
+
 After re-running `build_patient_features.py`, also wipe and re-load the
 Snowflake table so the dictionary cleanup propagates:
 
