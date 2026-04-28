@@ -64,7 +64,7 @@ respiratory risk scores in real time. Built for CSE 5114.
    ┌──────────────┐   ┌────────────────────┐                      │
    │ Open-Meteo   │ ─►│ Kafka topic        │                      │
    │ weather/AQI  │   │ environment_raw    │ ─► Spark Streaming ──┤
-   │ (every 5min) │   │ (3 partitions)     │    on location_id    │
+   │ (every 10min)│   │ (3 partitions)     │    on location_id    │
    └──────────────┘   └────────────────────┘                      │
                                                                   ▼
                                                   ┌─────────────────────────┐
@@ -105,7 +105,7 @@ respiratory risk scores in real time. Built for CSE 5114.
 | # | Stage | Latency | Output |
 |---|-------|---------|--------|
 | 1 | Synthea EHR → patient features + cohort | One-shot batch (~10 min) | Two parquet files on S3 |
-| 2 | Open-Meteo → Kafka producer | 5-minute pull cycle | JSON in `environment_raw` |
+| 2 | Open-Meteo → Kafka producer | 10-minute pull cycle | JSON in `environment_raw` |
 | 3 | Kafka → Spark Streaming (broadcast join) → scored events | ~1–2 s per microbatch | Parquet directly on S3 |
 | 4 | S3 → Snowflake (`COPY INTO`) + alert generation + dim refresh | 10-minute Airflow cycle | Snowflake tables refreshed |
 | 5 | Snowflake → Streamlit | 60–300 s cache TTL | Browser |
@@ -178,7 +178,7 @@ the real-time scorer.
 | Source | Kafka topic `environment_raw`, `startingOffsets=latest` | Tail mode — process only new events |
 | Sink | Parquet on S3 (`s3a://.../processed/respiratory_patient_features`) | Direct write avoids EBS→S3 sync hop |
 | Output mode | `append` | Each event is independent; no aggregation across triggers |
-| Trigger | Default (microbatch as fast as Kafka delivers) | The producer publishes every 5 min, so the stream idles between polls |
+| Trigger | Default (microbatch as fast as Kafka delivers) | The producer publishes every 10 min, so the stream idles between polls |
 | Checkpoint | `/mnt/synthea_data/checkpoints/respiratory_patient_features` | EBS-backed; required for exactly-once Kafka offsets |
 | Watermark | None | We don't need event-time aggregation; weather events score independently |
 | Join | `inner` join Kafka stream ↔ pre-filtered cohort with `broadcast()` hint | See "Streaming Join Optimization" below |
@@ -216,10 +216,12 @@ bring per-batch cost down to ~1–2 s with no shuffle on the patient side:
 
 Combined, the join cost shifts from O(microbatch + cohort) per batch
 (sort-merge + shuffle) to O(microbatch) per batch with a one-time
-O(cohort) broadcast at job start. Empirically, per-batch task fan-out
-dropped from 200 sort-merge tasks to 3 (one per Kafka input partition),
-and per-batch latency dropped from ~10 s to ~2 s — essential for
-sustained streaming throughput as Kafka volume grows.
+O(cohort) broadcast at job start. Empirically (measured directly in our
+running stream), per-batch task fan-out dropped from 200 sort-merge tasks
+to 3 (one per Kafka input partition), and per-batch latency dropped from
+~9.9 s (batch 244, 48 input rows) to ~2.8 s (batch 252, 15 input rows).
+Per-row cost is similar across both runs (~200 ms/row); the win is the
+elimination of fixed shuffle and scheduling overhead.
 
 ### Snowflake
 
@@ -664,7 +666,7 @@ or on top of an already-running pipeline. The script:
 | Window | Service |
 |---|---|
 | `kafka` | ZooKeeper + Kafka broker (creates topic) |
-| `producer` | weather_producer (open-meteo mode, 5-min cycle) |
+| `producer` | weather_producer (open-meteo mode, 10-min cycle) |
 | `stream` | Spark Structured Streaming risk scorer (broadcast join) |
 | `dashboard` | Streamlit (sources `.env` for Snowflake creds) |
 | `airflow` | `airflow standalone` |
