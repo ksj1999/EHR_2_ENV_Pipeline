@@ -8,8 +8,9 @@ respiratory risk scores in real time. Built for CSE 5114.
   from Synthea CSV exports.
 - **Streaming layer**: Kafka ingests weather/AQI events; Spark Structured
   Streaming joins them to the patient features and emits scored events.
-- **Warehouse layer**: Airflow syncs streaming output to S3 and `COPY INTO`s
-  Snowflake every 10 minutes; an alert task generates HIGH-risk notifications.
+- **Warehouse layer**: Spark Streaming writes scored events directly to S3 via
+  `s3a://`; Airflow `COPY INTO`s them into Snowflake every 10 minutes and an
+  alert task generates HIGH-risk notifications.
 - **Visualization layer**: Streamlit dashboard reads from Snowflake and
   shows population, environmental, and per-patient views.
 
@@ -51,8 +52,9 @@ respiratory risk scores in real time. Built for CSE 5114.
                 ┌────────────────────────────┐
                 │  Two parquet outputs on S3 │
                 │  ─────────────────────────  │
-                │  (a) ..._features          │ ──► Snowflake dashboard
-                │      ~1.58M patients       │     (per-patient queries)
+                │  (a) ..._features          │ ──► Snowflake (loaded by
+                │      ~1.58M patients       │     Airflow; dashboard reads
+                │                            │     per-patient queries)
                 │  (b) ..._features_cohort   │ ──► broadcast input for
                 │      ~600K patients,       │     streaming join below
                 │      respiratory only      │
@@ -177,7 +179,7 @@ the real-time scorer.
 | Source | Kafka topic `environment_raw`, `startingOffsets=latest` | Tail mode — process only new events |
 | Sink | Parquet on S3 (`s3a://.../processed/respiratory_patient_features`) | Direct write avoids EBS→S3 sync hop |
 | Output mode | `append` | Each event is independent; no aggregation across triggers |
-| Trigger | Default (microbatch as fast as Kafka delivers) | Open-Meteo only emits every 5 min, so this idles correctly |
+| Trigger | Default (microbatch as fast as Kafka delivers) | The producer publishes every 5 min, so the stream idles between polls |
 | Checkpoint | `/mnt/synthea_data/checkpoints/respiratory_patient_features` | EBS-backed; required for exactly-once Kafka offsets |
 | Watermark | None | We don't need event-time aggregation; weather events score independently |
 | Join | `inner` join Kafka stream ↔ pre-filtered cohort with `broadcast()` hint | See "Streaming Join Optimization" below |
@@ -189,20 +191,22 @@ checkpoint at the last committed Kafka offset.
 
 #### Streaming Join Optimization
 
-Joining the full ~4.78 M-row patient feature table against every weather
-event would force Spark into a sort-merge plan with a 200-way shuffle on
-every microbatch (observed at ~10 s for a 48-row batch in the unoptimized
-baseline). Two complementary optimizations bring per-batch cost down to
-~1 s with no shuffle on the patient side:
+In the original implementation the join's right side was the **raw**
+patient table (~4.78 M rows from the full Synthea export, before the
+data-quality cleanup described in [City Matching](#city-matching-ma-municipality-dictionary)).
+At that size, the table exceeded Spark's default broadcast threshold
+(10 MB), so Spark planned a sort-merge join with a 200-way shuffle on
+**every** microbatch — the unoptimized baseline measured ~10 s per
+microbatch on as few as 48 input events. Two complementary optimizations
+bring per-batch cost down to ~1–2 s with no shuffle on the patient side:
 
 1. **Cohort pre-filter (batch layer).** `build_patient_features.py` writes
    a second parquet at `…_cohort` containing only patients with any
    chronic respiratory condition (asthma, COPD spectrum, recent
    pneumonia/respiratory infection) or active respiratory medication
-   (oxygen, steroid, inhaler, leukotriene modifier). This drops the
-   join's right-hand side by roughly an order of magnitude — patients
-   without plausible exposure-driven respiratory risk are excluded from
-   per-event scoring.
+   (oxygen, steroid, inhaler, leukotriene modifier). After the MA city
+   dictionary filter plus this respiratory-only filter, the cohort is
+   ~600 K rows — small enough to broadcast cleanly to every executor.
 
 2. **Broadcast hash join (streaming layer).** `stream_risk_scores.py`
    reads from the cohort parquet, calls `.cache()` and then `.count()` to
@@ -213,8 +217,10 @@ baseline). Two complementary optimizations bring per-batch cost down to
 
 Combined, the join cost shifts from O(microbatch + cohort) per batch
 (sort-merge + shuffle) to O(microbatch) per batch with a one-time
-O(cohort) broadcast at job start — essential for sustained streaming
-throughput as Kafka volume grows.
+O(cohort) broadcast at job start. Empirically, per-batch task fan-out
+dropped from 200 sort-merge tasks to 3 (one per Kafka input partition),
+and per-batch latency dropped from ~10 s to ~2 s — essential for
+sustained streaming throughput as Kafka volume grows.
 
 ### Snowflake
 
@@ -263,7 +269,6 @@ load_patient_features ── refresh_dim_location ┘
 > EBS to S3 before the COPY INTO. Those were removed: Spark Structured
 > Streaming now writes directly to S3 via the `s3a://` filesystem, so the
 > intermediate sync step was a no-op.
-| `row_count_check` | UNION ALL row counts across the three main tables (logged for visibility) |
 
 ### Streamlit dashboard
 
@@ -312,10 +317,15 @@ One row per scored Kafka event. **Current: ~3.5 M rows, growing.**
 
 ### `patient_respiratory_features` (dimension)
 
-One row per patient with valid MA city + ≥ 1 respiratory feature. Rebuilt by
-`build_patient_features.py`. **Current: ~1.58 M rows.** (Down from the raw
+One row per patient with a valid MA municipality address. Rebuilt by
+`build_patient_features.py`. **Current: ~1.58 M rows** (down from the raw
 4.78 M after dropping non-MA patients and rows whose parsed `city` failed
-dictionary validation.)
+dictionary validation). Patients without any respiratory condition or
+medication still appear here — their condition / medication flags are
+just all zero and their `ehr_risk_score` is driven by age alone. The
+streaming join's right-hand side is the smaller `_cohort` parquet
+(~600 K rows) which additionally filters to patients with at least one
+respiratory flag — see [Streaming Join Optimization](#streaming-join-optimization).
 
 | Column | Type | Notes |
 |---|---|---|
@@ -363,16 +373,16 @@ FROM (
 ### `respiratory_alerts` (alerts log, append-only)
 
 Inserted by the Airflow `generate_high_risk_alerts` task. Patients are
-deduped against any alert in the last 24 hours.
+deduped against any alert in the last 24 hours. **Current: ~43 K rows.**
 
 | Column | Type | Notes |
 |---|---|---|
-| `patient_id`, `location_id` | STRING | |
-| `alert_time` | TIMESTAMP_TZ | `CURRENT_TIMESTAMP()` at insert |
+| `patient_id`, `location_id` | STRING | FKs to the patient and location dims |
+| `alert_time` | TIMESTAMP_NTZ | `CURRENT_TIMESTAMP()` at insert (UTC) |
 | `event_time` | TIMESTAMP_NTZ | The triggering weather event |
 | `final_risk_score`, `ehr_risk_score`, `weather_risk_score` | NUMBER | Snapshot at alert time |
-| `aqi`, `pm25`, `ozone` | NUMBER | Triggering conditions |
-| `age`, `has_asthma`, `has_copd`, `uses_oxygen` | dim snapshot | For the email summary |
+| `aqi`, `pm25`, `ozone` | NUMBER | Triggering conditions snapshot |
+| `age`, `has_asthma`, `has_copd`, `uses_oxygen` | dim snapshot | Denormalized from the patient row at insert time, used by the Gmail summary so it doesn't have to join back to the patient table |
 
 ---
 
