@@ -28,51 +28,65 @@ respiratory risk scores in real time. Built for CSE 5114.
    - [Streamlit dashboard](#streamlit-dashboard)
 4. [Snowflake Schema](#snowflake-schema)
 5. [Risk Scoring Logic](#risk-scoring-logic)
-6. [Configuration & Secrets](#configuration--secrets)
-7. [Setup](#setup)
-8. [Running the Pipeline](#running-the-pipeline)
-9. [Project Layout](#project-layout)
+6. [City Matching (MA Municipality Dictionary)](#city-matching-ma-municipality-dictionary)
+7. [Configuration & Secrets](#configuration--secrets)
+8. [Setup](#setup)
+9. [Running the Pipeline](#running-the-pipeline)
+10. [Project Layout](#project-layout)
 
 ---
 
 ## Architecture
 
 ```
-                   ┌──────────────────────┐
-                   │  Synthea CSV (S3)    │
-                   │  patients/conditions │
-                   │  encounters/meds     │
-                   └──────────┬───────────┘
-                              │ Spark batch (build_patient_features.py)
-                              ▼
-                   ┌──────────────────────┐
-                   │  patient_respiratory │
-                   │  _features (parquet) │   <─── EHR risk score, capped 0–25
-                   └──────────┬───────────┘
-                              │
-                              │  ┌─── joined on location_id ───┐
-                              ▼  ▼                             │
-   ┌──────────────┐    ┌────────────────────┐                  │
-   │ Open-Meteo   │ ─► │ Kafka topic        │                  │
-   │ weather/AQI  │    │ environment_raw    │ ─► Spark Stream ─┤
-   │ (every 5 min)│    │ (3 partitions)     │    (60s trigger) │
-   └──────────────┘    └────────────────────┘                  │
-                                                               ▼
-                                              ┌──────────────────────────┐
-                                              │ respiratory_patient_     │
-                                              │ features  (parquet, EBS) │
-                                              │  + final_risk_score      │
-                                              │  + final_risk_level      │
-                                              └────────┬─────────────────┘
-                                                       │
-                                  Airflow */10 (sync_to_s3 → COPY INTO)
-                                                       ▼
+                  ┌──────────────────────────┐
+                  │  Synthea CSV (S3, ~290GB)│
+                  │  patients/conditions     │
+                  │  encounters/medications  │
+                  └────────────┬─────────────┘
+                               │ Spark batch (build_patient_features.py)
+                               │   • EHR scoring (cap 0–25)
+                               │   • MA city dictionary validation
+                               ▼
+                ┌────────────────────────────┐
+                │  Two parquet outputs on S3 │
+                │  ─────────────────────────  │
+                │  (a) ..._features          │ ──► Snowflake dashboard
+                │      ~1.58M patients       │     (per-patient queries)
+                │  (b) ..._features_cohort   │ ──► broadcast input for
+                │      ~600K patients,       │     streaming join below
+                │      respiratory only      │
+                └────────────────────────────┘
+                               │
+                               │       ┌─── F.broadcast() join ───┐
+                               ▼       ▼                          │
+   ┌──────────────┐   ┌────────────────────┐                      │
+   │ Open-Meteo   │ ─►│ Kafka topic        │                      │
+   │ weather/AQI  │   │ environment_raw    │ ─► Spark Streaming ──┤
+   │ (every 5min) │   │ (3 partitions)     │    on location_id    │
+   └──────────────┘   └────────────────────┘                      │
+                                                                  ▼
+                                                  ┌─────────────────────────┐
+                                                  │ Scored events (parquet) │
+                                                  │ written DIRECTLY to S3  │
+                                                  │ via s3a:// (no EBS hop) │
+                                                  │ + final_risk_score      │
+                                                  │ + final_risk_level      │
+                                                  └────────┬────────────────┘
+                                                           │
+                                  Airflow DAG every 10 min:
+                                    1. COPY INTO respiratory_risk_scores
+                                    2. COPY INTO patient_respiratory_features
+                                    3. CREATE OR REPLACE dim_location
+                                    4. INSERT new HIGH-risk into alerts
+                                    5. Email summary if new alerts
+                                                           ▼
                                 ┌──────────────────────────────────────┐
                                 │ Snowflake (warehouse + DB.PUBLIC)    │
-                                │  respiratory_risk_scores  (fact)     │
-                                │  patient_respiratory_features (dim)  │
-                                │  dim_location             (dim)      │
-                                │  respiratory_alerts       (fact)     │
+                                │  respiratory_risk_scores       (fact)│
+                                │  patient_respiratory_features  (dim) │
+                                │  dim_location                  (dim) │
+                                │  respiratory_alerts            (fact)│
                                 │  respiratory_risk_scores_current (V) │
                                 └──────────────┬───────────────────────┘
                                                │
@@ -89,11 +103,15 @@ respiratory risk scores in real time. Built for CSE 5114.
 
 | # | Stage | Latency | Output |
 |---|-------|---------|--------|
-| 1 | Synthea EHR → patient features | One-shot batch (~10 min) | Parquet on S3 |
-| 2 | Open-Meteo → Kafka producer | 5-minute pull cycle | JSON in Kafka |
-| 3 | Kafka → Spark Streaming → scored parquet | ~60 s end-to-end | Parquet on EBS |
-| 4 | EBS → S3 → Snowflake | 10-minute Airflow cycle | Snowflake tables |
+| 1 | Synthea EHR → patient features + cohort | One-shot batch (~10 min) | Two parquet files on S3 |
+| 2 | Open-Meteo → Kafka producer | 5-minute pull cycle | JSON in `environment_raw` |
+| 3 | Kafka → Spark Streaming (broadcast join) → scored events | ~1–2 s per microbatch | Parquet directly on S3 |
+| 4 | S3 → Snowflake (`COPY INTO`) + alert generation + dim refresh | 10-minute Airflow cycle | Snowflake tables refreshed |
 | 5 | Snowflake → Streamlit | 60–300 s cache TTL | Browser |
+
+The streaming path writes directly to S3 (`s3a://...`) rather than through
+EBS — the previous EBS staging tasks were removed from the Airflow DAG
+because they had become a no-op.
 
 ---
 
@@ -273,12 +291,12 @@ SNOWFLAKE_SCHEMA   (optional, defaults to PUBLIC)
 
 ## Snowflake Schema
 
-A small star: one fact table, two dimension-ish tables, plus a view and an
-alerts table.
+A bounded star: one fact table, two dimension tables, plus a view and an
+alerts table. Current row counts live alongside each table.
 
 ### `respiratory_risk_scores` (fact, append-only)
 
-One row per scored Kafka event.
+One row per scored Kafka event. **Current: ~3.5 M rows, growing.**
 
 | Column | Type | Notes |
 |---|---|---|
@@ -294,15 +312,18 @@ One row per scored Kafka event.
 
 ### `patient_respiratory_features` (dimension)
 
-One row per patient. Rebuilt by `build_patient_features.py`.
+One row per patient with valid MA city + ≥ 1 respiratory feature. Rebuilt by
+`build_patient_features.py`. **Current: ~1.58 M rows.** (Down from the raw
+4.78 M after dropping non-MA patients and rows whose parsed `city` failed
+dictionary validation.)
 
 | Column | Type | Notes |
 |---|---|---|
 | `patient_id` | STRING | PK |
 | `age`, `gender`, `race`, `ethnicity` | demographics | |
-| `city`, `state`, `zip`, `lat`, `lon`, `location_id` | location | `lat`/`lon` may be NULL on legacy Synthea exports |
+| `city`, `state`, `zip`, `lat`, `lon`, `location_id` | location | `state = "MA"` always; `lat`/`lon` may be NULL on legacy Synthea exports |
 | `has_asthma`, `has_copd`, `has_emphysema`, `has_chronic_bronchitis`, `recent_pneumonia`, `recent_respiratory_infection` | 0/1 flags | |
-| `asthma_emergency_admission_count`, `emergency_encounter_count`, `hospital_admission_count`, `asthma_followup_count`, `respiratory_reason_count` | INT | within lookback (90 d) |
+| `asthma_emergency_admission_count`, `emergency_encounter_count`, `hospital_admission_count`, `asthma_followup_count`, `respiratory_reason_count` | INT | within lookback (90 d), each capped per term |
 | `uses_oxygen`, `uses_steroid`, `uses_inhaler`, `uses_respiratory_med` | 0/1 flags | "active" — start ≤ ref_date AND (stop is NULL or within lookback) |
 | `age_score`, `condition_score`, `encounter_score`, `medication_score` | INT | EHR sub-scores |
 | `ehr_risk_score` | INT | Capped at 25 |
@@ -311,16 +332,17 @@ One row per patient. Rebuilt by `build_patient_features.py`.
 
 ### `dim_location` (dimension)
 
-One row per location. **Bounded at ≤ 351 rows** (the count of MA
-municipalities). Refreshed on every Airflow run via `refresh_dim_location`
-(`CREATE OR REPLACE` from `patient_respiratory_features`). Lets queries that
-need city/state for a location join a small dim instead of going through the
-1.5 M-row patient table.
+One row per location. **Hard-bounded at ≤ 351 rows** (the count of MA
+municipalities). **Current: 348.** Refreshed on every Airflow run via
+`refresh_dim_location` (`CREATE OR REPLACE` from
+`patient_respiratory_features`). Lets queries that need city/state for a
+location join a small dim instead of going through the 1.58 M-row patient
+table.
 
 | Column | Type | Notes |
 |---|---|---|
 | `location_id` | STRING | PK — lowercased `<city>_<state>` |
-| `city` | STRING | Validated against MA municipality list — see batch job notes |
+| `city` | STRING | Always a valid MA municipality (dictionary-validated) |
 | `state` | STRING | Always `MA` in current data |
 | `zip` | STRING | Representative ZIP for the city |
 | `lat`, `lon` | NUMBER | May be NULL on legacy Synthea exports |
@@ -356,56 +378,139 @@ deduped against any alert in the last 24 hours.
 
 ## Risk Scoring Logic
 
-Final score = baseline EHR + acute weather + interaction + condition-specific
-sensitivity.
+Four signals combine into one score:
+
+```
+final = ehr_baseline                              # patient vulnerability (0-25, capped)
+      + weather_load                              # current environment (0-15)
+      + min(ehr × weather / 20, 12)               # interaction (vulnerable + bad day amplify)
+      + has_asthma  × ozone_score                 # asthma sensitivity bonus
+      + copd_flag   × particulate_score           # COPD sensitivity bonus
+```
+
+Each component is independently capped to keep the score interpretable.
 
 ### EHR baseline (0 – 25, capped) — patient vulnerability
 
-| Component | Max | Notes |
+Rebuilt by `build_patient_features.py` from Synthea conditions + encounters
++ medications within a 90-day lookback window.
+
+| Component | Max | How it's computed |
 |---|---|---|
-| Age | 3 | tiers at 50 / 65 / 75 |
-| COPD spectrum (max of COPD / emphysema / chronic bronchitis) | 4 | `greatest()` to avoid triple-counting one disease |
-| Asthma | 3 | |
-| Recent infection (pneumonia + recent resp infection) | 3 (capped) | |
-| Encounter history (ED, hospital, follow-up — each capped per term) | 18 | Frequent flyers can't dominate the population |
-| Medication intensity (oxygen 4 / steroid 2 / inhaler 1) | 7 | Oxygen is the strongest severity signal |
+| Age | 3 | Tiered: 50 → +1, 65 → +2, 75 → +3 |
+| COPD spectrum | 4 | `greatest()` of COPD / emphysema / chronic bronchitis flags — never triple-counted |
+| Asthma | 3 | Single flag |
+| Recent infection | 3 (capped) | Sum of pneumonia (3) + recent respiratory infection (1), then `least(_, 3)` |
+| Encounter history | 18 (capped) | ED admissions × 5 (cap 8), other emergencies × 2 (cap 4), hospital admits × 2 (cap 4), asthma follow-up × 1 (cap 2) |
+| Medication intensity | 7 | Oxygen × 4 + steroid × 2 + inhaler × 1 |
+| **Total cap** | **25** | Hard `least(sum, 25)` to prevent extreme outliers from skewing the population |
 
-### Weather components — acute environmental load
+EHR levels (used in dashboard's per-patient view): `low < 6`, `medium 6–11`,
+`high ≥ 12`.
 
-| Component | Max | Threshold rationale |
+### Weather components (0 – 15 typical) — acute environmental load
+
+Computed per Kafka event in `stream_risk_scores.py`. Thresholds anchored to
+EPA AQI breakpoints and WHO PM2.5 guidelines.
+
+| Component | Max | Threshold logic |
 |---|---|---|
-| Particulate (max of AQI / PM2.5 score) | 6 | Avoids double-counting (AQI is often computed from PM2.5) |
-| Ozone | 5 | EPA 8-h NAAQS = 70 ppb |
-| Humidity | 2 | Both very low (<25%) and very high (>85%) aggravate symptoms |
-| Temperature | 2 | Heat stress + cold-air bronchospasm |
+| Particulate | 6 | `max(aqi_score, pm25_score)` — avoids double-counting (AQI is often derived from PM2.5). Tiers: WHO 24h (15 µg/m³) → +1; EPA 24h NAAQS (35 µg/m³) → +3; severe (>250 µg/m³) → +6 |
+| Ozone | 5 | EPA 8-h NAAQS (70 ppb) → +1; tiers up to +5 at 200+ ppb |
+| Humidity | 2 | Both extremes aggravate symptoms: <25 % → +1, >70 % → +1, >85 % → +2 |
+| Temperature | 2 | Heat (>32 °C +1, >38 °C +2) and cold-air bronchospasm (<0 °C +1, <−10 °C +2) |
+| **Total** | **15** | Sum of components |
 
-Total weather: 0 – 15 typical.
+### Final levels
 
-### Final formula
-
-```
-final = ehr + weather
-      + min(ehr * weather / 20, 12)              # interaction term
-      + (has_asthma * ozone_score)               # asthmatics + ozone
-      + (copd_flag  * particulate_score)         # COPD + particulates
-```
-
-Levels: `low < 8`, `medium 8 – 17`, `high ≥ 18`.
+| Range | Level |
+|---|---|
+| `final < 8` | low |
+| `8 ≤ final < 18` | medium |
+| `final ≥ 18` | high |
 
 ### Worked examples
 
-| Patient profile | EHR | Weather | Final | Level |
-|---|---|---|---|---|
-| Healthy, clean day | 0 | 0 | 0 | low |
-| Healthy, polluted day | 0 | 8 | 8 | medium |
-| Stable COPD, clean day | 12 | 0 | 12 | medium |
-| Stable COPD, polluted day (incl. COPD-particulate bonus) | 12 | 8 | ~28 | high |
+| Patient profile | EHR | Weather | + Interaction | + Bonus | Final | Level |
+|---|---|---|---|---|---|---|
+| Healthy, clean day | 0 | 0 | 0 | 0 | **0** | low |
+| Healthy, polluted day | 0 | 8 | 0 | 0 | **8** | medium |
+| Stable COPD, clean day | 12 | 0 | 0 | 0 | **12** | medium |
+| Stable COPD, polluted day | 12 | 8 | 4.8 | 6 | **~30** | high |
+| Asthma + bad ozone day | 5 | 6 | 1.5 | 3 | **~16** | medium |
 
 > **Note on grounding:** The pollutant thresholds are aligned with EPA AQI
 > breakpoints and WHO PM2.5 guidelines. The point weights and combination
 > formula are heuristic — not validated against real exacerbation outcomes.
 > This is a clinical scoring rubric for a streaming-pipeline demo, not a
 > validated decision-support tool.
+
+---
+
+## City Matching (MA Municipality Dictionary)
+
+Synthea's legacy 17-column patient export packs city, state, and ZIP into a
+single ADDRESS string. The original regex used a greedy capture
+(`[A-Za-z .'\-]+`) which silently swallowed the street name into the city
+field — addresses like `"123 Fletcher Isle New Bedford MA 02742 US"` produced
+`city = "Fletcher Isle New Bedford"` and `location_id = "fletcher_isle_new_bedford_ma"`.
+
+The result was a `dim_location` table with **781,902 rows** of mostly
+fictitious "cities" that were really street-name fragments — nearly every
+address became its own location.
+
+### The fix: two-step validation
+
+**Step 1 — non-greedy regex with a constrained city group:**
+
+```python
+# build_patient_features.py
+addr_pattern = (
+    r"^.+? ((?:(?:New|North|South|East|West|Fall|Great)\s)?"
+    r"[A-Z][a-z]+) ([A-Z]{2}) ([0-9]{5}) US$"
+)
+```
+
+This still produces some false positives ("Fall Hingham" instead of just
+"Hingham" when a street name happens to end in "Fall"), so step 2 is
+required.
+
+**Step 2 — dictionary lookup against `MA_MUNICIPALITIES`:**
+
+A hardcoded `frozenset` of all 351 incorporated MA cities and towns
+(sourced from the Massachusetts Secretary of the Commonwealth):
+
+```python
+MA_MUNICIPALITIES = [
+    "Abington", "Acton", ..., "Boston", ..., "Fall River",
+    "New Bedford", "North Andover", ..., "Worcester", "Yarmouth",
+]
+```
+
+After the regex, every parsed `city` is normalized with `F.initcap()` and
+checked against this set. Rows whose city isn't a real MA municipality are
+**dropped** before `location_id` is built:
+
+```python
+patients_clean = (
+    patients_clean
+    .withColumn("city", F.initcap(F.col("city")))
+    .filter((F.col("state") == "MA") & F.col("city").isin(MA_MUNICIPALITIES))
+)
+```
+
+### Why this matters
+
+- **`dim_location` is now hard-bounded at ≤ 351 rows** (currently 348 — i.e. 348 of 351 MA municipalities have at least one Synthea patient).
+- **No more orphan events** — every `respiratory_risk_scores.location_id` joins to a real `dim_location` entry. Verified: 0 orphan events.
+- **Dashboard dropdowns finite and meaningful** — the Weather tab's region selector shows ~85 cities (those with ≥ 1000 patients) instead of 781,902 garbage entries.
+- **Defensible documentation** — "city values are validated against the official Massachusetts municipality list" is concrete and citable, not a hand-wavy regex.
+
+### Limitation
+
+The dictionary is MA-only. Synthea exports for other states would need
+separate per-state lists. Easy to extend (just add another `frozenset`)
+but not done here since the project is MA-scoped end-to-end.
 
 ---
 
@@ -445,11 +550,6 @@ airflow variables set DASHBOARD_URL      "http://<EC2_PUBLIC_IP>:8501"
 
 Get a Gmail app password at: myaccount.google.com → Security →
 2-Step Verification → App passwords.
-
-### What's in `.gitignore`
-
-`*.pem`, `*.key`, `*.p8`, `.env*`, `secrets.toml`, `checkpoints/`, `logs/`,
-`output/`, `data/`, raw Synthea archives, IDE folders, OS junk.
 
 ---
 
